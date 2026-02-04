@@ -18,81 +18,34 @@ export default function Home() {
   const [dilemma, setDilemma] = useState("");
   const [history, setHistory] = useState<Message[]>([]);
   const [isDebating, setIsDebating] = useState(false);
-  const [currentStreamBuffer, setCurrentStreamBuffer] = useState(""); // Holds the entire raw stream of the current turn
+  const [activeAgentId, setActiveAgentId] = useState<string | null>(null);
   const [selectedTargetId, setSelectedTargetId] = useState<string | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  // Derived state from stream buffer
-  // Parse buffer dynamically to render live results
-  const parseStream = (buffer: string): Message[] => {
-    const messages: Message[] = [];
-    if (!buffer) return messages;
-
-    // Regex to find all agent markers and their content
-    // Splits by __START_AGENT__:ID
-    // result[0] is text before first marker (usually empty or garbage newline)
-    // result[1] is ID, result[2] is text, result[3] is ID...
-    // We use a simpler split strategy or exact match loop
-
-    const parts = buffer.split(/__START_AGENT__:([a-zA-Z0-9_-]+)/g);
-
-    // parts[0] is usually "\n" or empty if stream starts immediately with marker
-
-    for (let i = 1; i < parts.length; i += 2) {
-      const agentId = parts[i]?.trim();
-      const content = parts[i + 1]; // content coming after this agent
-
-      if (agentId && agents.find(a => a.id === agentId)) {
-        const agentName = agents.find(a => a.id === agentId)?.name;
-        // Clean up content: usually starts with \n
-        const cleanContent = content ? content.replace(/^\n/, "") : "";
-
-        if (cleanContent || i === parts.length - 2) {
-          // allow empty content if it's the very last one (active thinking)
-          messages.push({
-            role: "assistant",
-            name: agentName,
-            content: cleanContent
-          });
-        }
-      }
-    }
-    return messages;
-  };
-
-  const currentTurnMessages = parseStream(currentStreamBuffer);
-
-  // Identify active agent from the last parsed message in the stream
-  const activeAgentId = isDebating && currentTurnMessages.length > 0
-    ? agents.find(a => a.name === currentTurnMessages[currentTurnMessages.length - 1].name)?.id
-    : null;
 
   // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [history, currentTurnMessages.length, currentStreamBuffer.length]);
+  }, [history, activeAgentId]);
 
   const resetDebate = () => {
     setDilemma("");
     setHistory([]);
     setIsDebating(false);
-    setCurrentStreamBuffer("");
+    setActiveAgentId(null);
     setSelectedTargetId(null);
   };
 
   const startDebate = async () => {
-    const targetId = selectedTargetId;
-
+    // 1. Setup
     if ((!dilemma.trim() && history.length === 0) || isDebating) return;
 
     setIsDebating(true);
-    setCurrentStreamBuffer(""); // Reset stream buffer for new turn
 
+    // 2. Prepare local context (Add user message if exists)
     let currentHistory = [...history];
-
     if (dilemma.trim()) {
       const userMsg: Message = { role: "user", content: dilemma, name: "User" };
       currentHistory = [...currentHistory, userMsg];
@@ -100,47 +53,60 @@ export default function Home() {
       setDilemma("");
     }
 
+    // 3. Determine Execution Plan
+    // If target selected, run strictly that agent.
+    // If no target, run ALL agents sequentially (The "Board Meeting").
+    const executionQueue = selectedTargetId
+      ? [agents.find(a => a.id === selectedTargetId)!]
+      : agents;
+
     const contextDilemma = (history.length > 0 && history[0].role === 'user') ? history[0].content : dilemma;
 
     try {
-      const response = await fetch("/api/debate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          dilemma: contextDilemma,
-          history: currentHistory,
-          targetAgentId: targetId
-        }),
-      });
+      for (const agent of executionQueue) {
+        // Set UI to "Thinking" state for this agent
+        setActiveAgentId(agent.id);
 
-      if (!response.body) throw new Error("No response body");
+        // Call API Synchronously
+        const response = await fetch("/api/debate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dilemma: contextDilemma,
+            history: currentHistory, // Pass accumulated history
+            targetAgentId: agent.id
+          }),
+        });
 
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
+        if (!response.ok) {
+          console.error("API Error", response.status);
+          continue;
+        }
 
-      let accumulated = "";
+        const data = await response.json();
 
-      // eslint-disable-next-line no-constant-condition
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+        // Validate response
+        if (data.content) {
+          const newMsg: Message = {
+            role: "assistant",
+            name: agent.name,
+            content: data.content
+          };
 
-        const chunk = decoder.decode(value, { stream: true });
-        accumulated += chunk;
-        setCurrentStreamBuffer(accumulated);
+          // Update Local Context for NEXT agent
+          currentHistory = [...currentHistory, newMsg];
+
+          // Update UI Immediately
+          setHistory(currentHistory);
+        }
       }
 
-      // Stream finished.
-      // Commit the parsed messages to permanent history and clear stream buffer.
-      const finalMessages = parseStream(accumulated);
-      setHistory(prev => [...prev, ...finalMessages]);
-      setCurrentStreamBuffer("");
-
     } catch (error) {
-      console.error("Debate error:", error);
+      console.error("Debate orchestration error:", error);
     } finally {
       setIsDebating(false);
-      setSelectedTargetId(null);
+      setActiveAgentId(null);
+      setSelectedTargetId(null); // Reset after action
     }
   };
 
@@ -186,7 +152,7 @@ export default function Home() {
               key={agent.id}
               agent={agent}
               isActive={activeAgentId === agent.id}
-              isThinking={activeAgentId === agent.id && (!currentTurnMessages.find(m => m.name === agent.name)?.content)}
+              isThinking={activeAgentId === agent.id} // Simple check now
             />
           ))}
         </div>
@@ -202,12 +168,11 @@ export default function Home() {
               </div>
             )}
 
-            {/* Combined View: History + Live Stream */}
-            {[...history, ...currentTurnMessages].map((msg, i) => (
+            {history.map((msg, i) => (
               <motion.div
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
-                key={i} // simple key, theoretically should use unique id
+                key={i}
                 className={cn(
                   "flex flex-col max-w-3xl",
                   msg.role === "user" ? "ml-auto items-end" : "mr-auto items-start"
@@ -227,19 +192,28 @@ export default function Home() {
                   )}
                 >
                   {msg.content}
-                  {/* Blinking cursor for the very last message if it is assistant and debating */}
-                  {isDebating && i === (history.length + currentTurnMessages.length - 1) && msg.role === "assistant" && (
-                    <span className="inline-block w-1.5 h-4 ml-1 align-middle bg-primary animate-pulse" />
-                  )}
                 </div>
               </motion.div>
             ))}
 
-            {/* If debating but no messages parsed yet (waiting for first chunk) */}
-            {isDebating && currentTurnMessages.length === 0 && (
-              <div className="flex flex-col max-w-3xl mr-auto items-start animate-pulse opacity-50">
-                <span className="text-xs text-neutral-500">O conselho está pensando...</span>
-              </div>
+            {/* Thinking Indicator for Synchronous Mode */}
+            {isDebating && activeAgentId && (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="flex flex-col max-w-3xl mr-auto items-start"
+              >
+                <div className="flex items-center space-x-2 mb-1">
+                  <span className="text-xs font-medium text-primary animate-pulse">
+                    {agents.find(a => a.id === activeAgentId)?.name} is typing...
+                  </span>
+                </div>
+                <div className="p-4 rounded-2xl text-sm leading-relaxed bg-surface/80 border border-primary/20 rounded-tl-none flex items-center">
+                  <span className="w-2 h-2 bg-primary rounded-full animate-bounce mr-1" />
+                  <span className="w-2 h-2 bg-primary rounded-full animate-bounce mr-1 delay-75" />
+                  <span className="w-2 h-2 bg-primary rounded-full animate-bounce delay-150" />
+                </div>
+              </motion.div>
             )}
           </div>
 

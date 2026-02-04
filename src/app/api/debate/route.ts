@@ -2,9 +2,6 @@ import { NextRequest, NextResponse } from "next/server";
 import { groq } from "@/lib/groq";
 import { agents, Agent } from "@/lib/agents";
 
-// Allow streaming
-// export const runtime = "edge"; // Groq SDK preference
-
 interface Message {
     role: "system" | "user" | "assistant";
     content: string;
@@ -21,63 +18,27 @@ export async function POST(req: NextRequest) {
     try {
         const { dilemma, history = [], targetAgentId } = (await req.json()) as RequestBody;
 
-        if (!dilemma) {
-            return NextResponse.json({ error: "Dilemma is required" }, { status: 400 });
+        if (!dilemma && history.length === 0) {
+            return NextResponse.json({ error: "Context required" }, { status: 400 });
         }
 
-        const encoder = new TextEncoder();
-        const stream = new ReadableStream({
-            async start(controller) {
-                try {
-                    if (targetAgentId) {
-                        const agent = agents.find((a) => a.id === targetAgentId);
-                        if (!agent) throw new Error("Agent not found");
+        // Default to the first agent if none specified (though frontend should drive this)
+        const agent = targetAgentId
+            ? agents.find((a) => a.id === targetAgentId)
+            : agents[0];
 
-                        controller.enqueue(encoder.encode(`__START_AGENT__:${agent.id}\n`));
-                        await generateAgentResponse(agent, dilemma, history, controller);
-                    } else {
-                        const sessionMessages: Message[] = [...history];
+        if (!agent) {
+            return NextResponse.json({ error: "Agent not found" }, { status: 404 });
+        }
 
-                        for (const agent of agents) {
-                            controller.enqueue(encoder.encode(`__START_AGENT__:${agent.id}\n`));
+        const responseContent = await generateAgentResponse(agent, dilemma, history);
 
-                            try {
-                                const responseContent = await generateAgentResponse(
-                                    agent,
-                                    dilemma,
-                                    sessionMessages,
-                                    controller
-                                );
-
-                                if (responseContent) {
-                                    sessionMessages.push({
-                                        role: "assistant",
-                                        name: agent.name,
-                                        content: responseContent,
-                                    });
-                                }
-                            } catch (e) {
-                                console.error(`Error generating for ${agent.name}:`, e);
-                                const errorMsg = `[System Error: Failed to generate response for ${agent.name}]`;
-                                controller.enqueue(encoder.encode(errorMsg));
-                            }
-                        }
-                    }
-                    controller.close();
-                } catch (err) {
-                    console.error("Streaming error:", err);
-                    controller.error(err);
-                }
-            },
+        return NextResponse.json({
+            role: "assistant",
+            name: agent.name,
+            content: responseContent
         });
 
-        return new NextResponse(stream, {
-            headers: {
-                "Content-Type": "text/event-stream",
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-            },
-        });
     } catch (error) {
         console.error("API Error:", error);
         return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
@@ -87,11 +48,8 @@ export async function POST(req: NextRequest) {
 async function generateAgentResponse(
     agent: Agent,
     dilemma: string,
-    history: Message[],
-    controller: ReadableStreamDefaultController
+    history: Message[]
 ): Promise<string> {
-    const encoder = new TextEncoder();
-
     const systemMessage = {
         role: "system" as const,
         content: `${agent.systemPrompt}
@@ -113,45 +71,41 @@ async function generateAgentResponse(
     const messages = [
         systemMessage,
         ...formattedHistory,
-        { role: "user" as const, content: `The dilemma is: ${dilemma}. What is your view?` },
+        {
+            role: "user" as const,
+            content: `Considerando o dilema e a discussão acima, qual a sua posição, ${agent.name}? Reaja como sua persona (${agent.role} da ${agent.company}) e traga um ângulo único.`
+        },
     ];
 
-    let accumulatedContent = "";
+    // Model selection
+    const envModel = process.env.GROQ_MODEL;
+    const defaultModels = ["openai/gpt-oss-20b", "llama3-70b-8192", "mixtral-8x7b-32768"];
+    const models = envModel ? [envModel, ...defaultModels] : defaultModels;
 
-    // Model Fallback Logic
-    const models = ["openai/gpt-oss-20b", "llama3-70b-8192", "mixtral-8x7b-32768"];
-    let completionStream = null;
+    let responseText = "";
 
     for (const model of models) {
         try {
-            console.log(`Trying model: ${model}`);
-            completionStream = await groq.chat.completions.create({
+            console.log(`Generating for ${agent.name} with model: ${model}`);
+            const completion = await groq.chat.completions.create({
                 // eslint-disable-next-line @typescript-eslint/no-explicit-any
                 messages: messages as any,
                 model: model,
-                stream: true,
+                stream: false, // Explicitly synchronous
                 temperature: 0.7,
                 max_tokens: 400,
             });
-            break; // Success
+
+            responseText = completion.choices[0]?.message?.content || "";
+            if (responseText) break;
         } catch (e) {
-            console.warn(`Model ${model} failed, trying next. Error:`, e);
+            console.warn(`Model ${model} failed for ${agent.name}:`, e);
         }
     }
 
-    if (!completionStream) {
-        const err = "All models failed to generate response.";
-        console.error(err);
-        throw new Error(err);
+    if (!responseText) {
+        throw new Error(`Failed to generate response for ${agent.name} with all models.`);
     }
 
-    for await (const chunk of completionStream) {
-        const content = chunk.choices[0]?.delta?.content || "";
-        if (content) {
-            accumulatedContent += content;
-            controller.enqueue(encoder.encode(content));
-        }
-    }
-
-    return accumulatedContent;
+    return responseText;
 }
