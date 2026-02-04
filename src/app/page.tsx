@@ -117,9 +117,6 @@ export default function Home() {
         {/* Header */}
         <header className="flex-none mb-6 flex items-center justify-between">
           <div className="flex items-center space-x-3">
-            <div className="w-10 h-10 bg-primary/20 rounded-lg flex items-center justify-center border border-primary/50 text-primary">
-              <span className="font-bold text-xl">IW</span>
-            </div>
             <div>
               <h1 className="text-2xl font-bold tracking-tight">Board Virtual</h1>
               <p className="text-xs text-neutral-400 flex items-center gap-1.5 mt-0.5">
